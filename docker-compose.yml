@@ -1,0 +1,29 @@
+# Demo: two limiter instances sharing one Redis => one global limit.
+#   docker compose up --build
+#   curl -i "localhost:8081/check?key=alice"; curl -i "localhost:8082/check?key=alice"
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  limiter-a: &limiter
+    build: .
+    environment:
+      RL_BACKEND: redis
+      RL_REDIS_ADDR: redis:6379
+      RL_ALGORITHM: token_bucket
+      RL_RATE: "5"
+      RL_BURST: "10"
+    ports: ["8081:8080"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  limiter-b:
+    <<: *limiter
+    ports: ["8082:8080"]

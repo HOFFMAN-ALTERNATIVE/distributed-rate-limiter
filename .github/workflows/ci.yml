@@ -1,0 +1,75 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+          args: --build-tags integration
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.22", "1.23"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: go build ./...
+      - run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - run: go tool cover -func=coverage.out | tail -1
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      REDIS_ADDR: localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Integration tests (real Redis)
+        run: go test -race -count=1 -tags integration -run Integration -v ./ratelimit
+      - name: Benchmarks
+        run: go test -tags integration -run '^$' -bench . -benchmem -benchtime 1s ./ratelimit
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t drl:ci .
+      - name: Smoke test
+        run: |
+          docker run -d --name drl -p 8080:8080 -e RL_BURST=2 -e RL_RATE=0.1 drl:ci
+          for i in $(seq 1 20); do curl -fs localhost:8080/healthz && break; sleep 0.5; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'localhost:8080/check?key=ci')" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'localhost:8080/check?key=ci')" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'localhost:8080/check?key=ci')" = 429
+          curl -fs localhost:8080/metrics | grep -q ratelimit_decisions_total
+      - if: always()
+        run: docker logs drl || true
