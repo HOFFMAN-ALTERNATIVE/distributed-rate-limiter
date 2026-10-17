@@ -7,7 +7,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,6 +26,15 @@ import (
 )
 
 func main() {
+	// `ratelimiterd healthcheck` lets a distroless image (no shell, no curl)
+	// run a Docker HEALTHCHECK with the binary it already has.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		if err := healthcheck(); err != nil {
+			fmt.Fprintln(os.Stderr, "unhealthy:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(log); err != nil {
 		log.Error("fatal", "err", err)
@@ -113,7 +124,16 @@ func buildLimiter(cfg config.Config) (ratelimit.Limiter, func(context.Context) e
 		return l, nil, func() { close(done) }, nil
 	}
 
-	client := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, DB: cfg.RedisDB})
+	// Explicit timeouts: the per-decision context deadline bounds each call,
+	// these bound connection setup and pool waits underneath it.
+	client := redis.NewClient(&redis.Options{
+		Addr:         cfg.RedisAddr,
+		DB:           cfg.RedisDB,
+		DialTimeout:  2 * time.Second,
+		ReadTimeout:  time.Second,
+		WriteTimeout: time.Second,
+		PoolTimeout:  time.Second,
+	})
 	ready := func(ctx context.Context) error { return client.Ping(ctx).Err() }
 	closeFn := func() { _ = client.Close() }
 	var (
@@ -130,4 +150,26 @@ func buildLimiter(cfg config.Config) (ratelimit.Limiter, func(context.Context) e
 		return nil, nil, nil, err
 	}
 	return l, ready, closeFn, nil
+}
+
+// healthcheck probes /healthz on the configured port over loopback.
+func healthcheck() error {
+	addr := os.Getenv("RL_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:" + port + "/healthz")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
 }

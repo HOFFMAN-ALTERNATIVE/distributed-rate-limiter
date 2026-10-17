@@ -15,6 +15,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Request limits for /check. Keys end up as Redis keys and map entries, so an
+// unbounded key would let one client inflate backend memory.
+const (
+	MaxKeyBytes  = 256
+	maxBodyBytes = 4 << 10
+)
+
 // CheckResponse is the JSON body returned by /check.
 type CheckResponse struct {
 	Allowed      bool   `json:"allowed"`
@@ -52,7 +59,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if s.Ready != nil {
 			if err := s.Ready(r.Context()); err != nil {
-				http.Error(w, "not ready: "+err.Error(), http.StatusServiceUnavailable)
+				// Do not echo the error: it can contain backend addresses.
+				http.Error(w, "not ready: backend unreachable", http.StatusServiceUnavailable)
 				return
 			}
 		}
@@ -70,7 +78,12 @@ func (s *Server) check(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	key := r.FormValue("key")
+	if len(key) > MaxKeyBytes {
+		writeError(w, http.StatusBadRequest, "key must be at most 256 bytes")
+		return
+	}
 	cost := 1
 	if c := r.FormValue("cost"); c != "" {
 		n, err := strconv.Atoi(c)

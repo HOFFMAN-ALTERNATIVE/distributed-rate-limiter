@@ -4,6 +4,7 @@
 services:
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -13,6 +14,9 @@ services:
 
   limiter-a: &limiter
     build: .
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
     environment:
       RL_BACKEND: redis
       RL_REDIS_ADDR: redis:6379

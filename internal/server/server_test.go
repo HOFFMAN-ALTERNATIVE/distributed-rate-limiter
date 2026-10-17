@@ -89,3 +89,14 @@ func TestOpsEndpoints(t *testing.T) {
 		t.Fatalf("metrics missing decision counter:\n%s", body)
 	}
 }
+
+func TestCheckRejectsOversizedKey(t *testing.T) {
+	ts := newTestServer(t)
+	long := strings.Repeat("k", MaxKeyBytes+1)
+	if resp, _ := get(t, ts.URL+"/check?key="+long); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized key: got %d, want 400", resp.StatusCode)
+	}
+	if resp, _ := get(t, ts.URL+"/check?key="+long[:MaxKeyBytes]); resp.StatusCode != http.StatusOK {
+		t.Fatalf("key at the limit: got %d, want 200", resp.StatusCode)
+	}
+}

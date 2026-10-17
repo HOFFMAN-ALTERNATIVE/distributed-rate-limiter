@@ -5,26 +5,19 @@
 ![Redis](https://img.shields.io/badge/Redis-Lua%20scripts-DC382D?logo=redis&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A production-style **distributed rate limiter** in Go: a library *and* a standalone
-HTTP service. Token bucket and sliding-window-log algorithms, an in-memory backend
-for single instances and a **Redis backend where every decision is one atomic Lua
-script**, `net/http` middleware, Prometheus metrics, env-based config, a distroless
-image and a two-instance docker-compose demo.
+Rate limits that hold across replicas. Every decision against Redis is one Lua script, so two replicas can never both spend the last token. The integration suite runs four clients against one Redis and checks that the global limit is hit exactly, with not one request over.
+
+Use it as a Go library (`ratelimit` + `net/http` middleware) or run `ratelimiterd` and call `GET /check?key=...` from any language. Token bucket and sliding-window log, in-memory or Redis backends, Prometheus metrics, a distroless non-root image.
+
+Measured on an 8 vCPU Xeon VM, Go 1.27, in-memory backend: 57 ns per decision across 10k keys, 226 ns when every goroutine hits the same key, zero allocations. The Redis backend costs one round trip per decision; CI benchmarks it against a real Redis 7 on every push.
 
 ## Why
 
-Rate limiting looks trivial until you run more than one replica. Per-process
-counters multiply the real limit by the replica count, and naive
-`GET` → compute → `SET` against Redis races under load and lets bursts through.
-This project shows how to do it correctly:
+Per-process counters multiply the real limit by the replica count. A `GET`, compute, `SET` sequence against Redis races under load and lets bursts through. This project closes both gaps:
 
-- **One round-trip, zero races.** Read-refill-consume-write happens inside Redis
-  in a single `EVALSHA`; there is no window between check and update.
-- **One clock.** Scripts use Redis `TIME`, so replicas with skewed clocks still
-  agree on a single timeline.
-- **Exactness is tested**, not assumed: the integration suite runs four
-  independent clients against one Redis and asserts the global limit is hit
-  *exactly* — never one request more.
+- **One round trip, no race window.** Refill, consume and write happen inside Redis in a single `EVALSHA`.
+- **One clock.** Scripts read Redis `TIME`, so replicas with skewed clocks agree on one timeline.
+- **Exactness is a test,** not a claim (`TestIntegration_DistributedExactness` in `ratelimit/redis_integration_test.go`).
 
 ## Features
 
@@ -32,7 +25,7 @@ This project shows how to do it correctly:
 |---|---|
 | Algorithms | Token bucket (rate + burst), sliding window log (exact N per window) |
 | Backends | In-memory (64-way lock striping, zero allocations) · Redis / Redis Cluster (hash-tagged keys) |
-| Weighted requests | `AllowN(ctx, key, cost)` — e.g. charge expensive endpoints more |
+| Weighted requests | `AllowN(ctx, key, cost)`, for example to charge expensive endpoints more |
 | Integration | `net/http` middleware with `RateLimit-Limit`, `RateLimit-Remaining`, `Retry-After` headers; pluggable key funcs |
 | Service | `ratelimiterd`: `/check`, `/demo`, `/healthz`, `/readyz`, `/metrics` |
 | Failure policy | Fail-closed by default (503); opt-in fail-open wrapper |
@@ -125,7 +118,7 @@ http.ListenAndServe(":8080", mw(appHandler))
 ```
 
 Swap `NewRedisTokenBucket` for `NewMemoryTokenBucket`, `NewRedisSlidingWindow` or
-`NewMemorySlidingWindow` — they all implement `ratelimit.Limiter`.
+`NewMemorySlidingWindow`; they all implement `ratelimit.Limiter`.
 
 ### Configuration (environment)
 
@@ -141,16 +134,19 @@ Swap `NewRedisTokenBucket` for `NewMemoryTokenBucket`, `NewRedisSlidingWindow` o
 | `RL_FAIL_OPEN` | `false` | Allow requests when the backend errors |
 | `RL_BACKEND_TIMEOUT` | `50ms` | Per-decision deadline |
 
-## Design decisions & trade-offs
+## Design decisions and trade-offs
+
+Recorded as ADRs: [0001 Lua scripts instead of MULTI/WATCH](docs/adr/0001-lua-scripts-over-optimistic-transactions.md), [0002 fail closed by default](docs/adr/0002-fail-closed-by-default.md), [0003 Redis TIME as the only clock](docs/adr/0003-redis-time-as-the-clock.md).
+
 
 - **Token bucket vs sliding log.** Token bucket is O(1) memory per key and allows
-  controlled bursts — the right default for APIs. Sliding log is *exact* (no 2×
+  controlled bursts, which is the right default for APIs. Sliding log is *exact* (no 2×
   burst at window boundaries like fixed windows), at O(limit) memory per key;
   use it for low limits where precision matters (logins, verification-code sends, payments).
   The in-memory sliding log uses a fixed ring buffer so it never allocates on the
   hot path.
-- **Lua over `MULTI`/`WATCH`.** Optimistic transactions retry under contention —
-  exactly when a limiter is busiest. A script runs atomically with no retries and
+- **Lua over `MULTI`/`WATCH`.** Optimistic transactions retry under contention,
+  which is exactly when a limiter is busiest. A script runs atomically with no retries and
   a single round-trip.
 - **Redis time, not client time.** Avoids clock-skew bugs across replicas at the
   cost of one extra `TIME` call inside the script (sub-microsecond).
@@ -164,22 +160,22 @@ Swap `NewRedisTokenBucket` for `NewMemoryTokenBucket`, `NewRedisSlidingWindow` o
   into `FailOpen` explicitly; swallowed errors are still counted in metrics.
 - **No per-key metric labels.** Keys are unbounded (IPs, users); labelling by key
   would explode Prometheus cardinality. Metrics are per limiter and decision.
-- **Middleware does not trust `X-Forwarded-For`** by default — spoofable headers
+- **Middleware does not trust `X-Forwarded-For`** by default. Spoofable headers
   must be an explicit choice (`KeyByHeader`) behind a trusted proxy.
 
 ## Benchmarks
 
-`make bench` on an 8-vCPU Xeon VM (Go 1.24, `-race` off):
+`go test -run '^$' -bench Memory -benchmem ./ratelimit` on an 8 vCPU Xeon VM, Go 1.27.2:
 
 ```
-BenchmarkMemoryTokenBucket_HotKey-8       260.7 ns/op   0 B/op   0 allocs/op
-BenchmarkMemoryTokenBucket_10kKeys-8       54.5 ns/op   0 B/op   0 allocs/op
-BenchmarkMemorySlidingWindow_10kKeys-8     55.2 ns/op   0 B/op   0 allocs/op
+BenchmarkMemoryTokenBucket_HotKey-8       226.0 ns/op   0 B/op   0 allocs/op
+BenchmarkMemoryTokenBucket_10kKeys-8       56.8 ns/op   0 B/op   0 allocs/op
+BenchmarkMemorySlidingWindow_10kKeys-8     59.6 ns/op   1 B/op   0 allocs/op
 ```
 
 The hot-key case is bound by a single shard mutex (worst case: every goroutine
 on one key); spread keys scale across the 64 shards. The Redis backend is
-dominated by network round-trip time — CI runs `BenchmarkRedisTokenBucket`
+dominated by network round-trip time; CI runs `BenchmarkRedisTokenBucket`
 against a real Redis service container on every push.
 
 ## Development
@@ -195,6 +191,23 @@ make docker && make up
 CI (`.github/workflows/ci.yml`): golangci-lint · unit tests on Go 1.22 and 1.23 ·
 integration tests + benchmarks against a Redis 7 service container · Docker
 build and HTTP smoke test of the image.
+
+## Limits
+
+- No Redis Sentinel or Cluster failover logic of its own. Keys are hash-tagged so Cluster works, but failover behaviour is whatever go-redis and your Redis setup give you.
+- During a Redis outage the service fails closed (503). Fail-open is one env var away, and then limits are not enforced at all; there is no local fallback bucket yet.
+- The sliding-window log keeps one entry per request, so memory per key grows with the limit. Use the token bucket for limits in the thousands.
+- `/check` has no authentication. Run it on a private network or behind your gateway; it is a policy oracle, not a public endpoint.
+- The `/demo` endpoint keys by `RemoteAddr`. Behind a proxy every client shares one key unless you configure `KeyByHeader` for your trusted proxy header.
+
+## Operations
+
+- `/healthz` liveness, `/readyz` pings Redis, `/metrics` Prometheus. The image runs `ratelimiterd healthcheck` as its Docker `HEALTHCHECK`.
+- SIGTERM stops accepting connections and drains in-flight requests for up to 10 s.
+- Server timeouts: 5 s read header, 10 s read and write, 60 s idle. Redis: 2 s dial, 1 s read/write/pool, plus the per-decision deadline (`RL_BACKEND_TIMEOUT`, default 50 ms).
+- `/check` rejects keys over 256 bytes and request bodies over 4 KiB.
+
+See [SECURITY.md](SECURITY.md) for the threat model and how to report a vulnerability.
 
 ## Project layout
 
@@ -217,4 +230,4 @@ docker pull ghcr.io/hoffman-alternative/distributed-rate-limiter:latest
 
 ## License
 
-MIT © Herman Hoffman
+MIT

@@ -57,6 +57,16 @@ jobs:
       - name: Benchmarks
         run: go test -tags integration -run '^$' -bench . -benchmem -benchtime 1s ./ratelimit
 
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
+
   docker:
     runs-on: ubuntu-latest
     steps:
@@ -71,5 +81,7 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' 'localhost:8080/check?key=ci')" = 200
           test "$(curl -s -o /dev/null -w '%{http_code}' 'localhost:8080/check?key=ci')" = 429
           curl -fs localhost:8080/metrics | grep -q ratelimit_decisions_total
+          docker exec drl /ratelimiterd healthcheck
+          docker inspect --format '{{.Config.User}}' drl | grep -q nonroot
       - if: always()
         run: docker logs drl || true
