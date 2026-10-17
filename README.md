@@ -207,6 +207,14 @@ internal/server/    HTTP API of ratelimiterd
 cmd/ratelimiterd/   service entrypoint
 ```
 
+## Container image
+
+Multi-arch (amd64/arm64) images are published to GitHub Container Registry on every release:
+
+```bash
+docker pull ghcr.io/hoffman-alternative/distributed-rate-limiter:latest
+```
+
 ## License
 
 MIT © Herman Hoffman
